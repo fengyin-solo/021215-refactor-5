@@ -4,6 +4,8 @@
  * 2.x UMD 版本无 private class fields，彻底避免 Vite 兼容性问题
  */
 
+import type { PageBaseSize, PageLayout } from './page-geometry'
+
 /* ------------------------------------------------------------------ */
 /*  PDF.js 2.x 类型定义（无需 @types/pdfjs-dist，手动声明核心接口）       */
 /* ------------------------------------------------------------------ */
@@ -247,12 +249,13 @@ export async function buildAnnotationLayer(
 
 /**
  * 获取每页的原始尺寸（未缩放，scale=1）
- * 用于精确预计算不同尺寸页面的布局
+ * 用于精确预计算不同尺寸页面的布局；页面 CSS 尺寸与各层绘制
+ * 后续都经 PageGeometry 从这份预计算结果换算
  */
 export async function getPageBaseDimensions(
   doc: PdfjsDocument,
-): Promise<Map<number, { baseWidth: number; baseHeight: number }>> {
-  const result = new Map<number, { baseWidth: number; baseHeight: number }>()
+): Promise<Map<number, PageBaseSize>> {
+  const result = new Map<number, PageBaseSize>()
   // 并发获取所有页面尺寸，每批 10 页避免过多并发
   const batchSize = 10
   for (let start = 1; start <= doc.numPages; start += batchSize) {
@@ -432,20 +435,21 @@ export async function searchDocument(
 
 /**
  * 构建高亮层 — 根据搜索结果在页面上绘制高亮矩形
- * 高亮层使用与 PDF.js text layer 完全相同的坐标系统，确保缩放后精确对齐
+ * 尺寸与坐标换算统一取自 PageGeometry 预计算的 PageLayout，
+ * 与 PDF.js text layer 使用完全相同的口径，缩放后精确对齐
  */
 export function buildHighlightLayer(
   container: HTMLDivElement,
   matches: SearchMatch[],
-  viewport: PdfjsViewport,
+  layout: PageLayout,
   currentMatchIndex?: number,
 ): void {
   container.innerHTML = ''
   container.style.position = 'absolute'
   container.style.top = '0'
   container.style.left = '0'
-  container.style.width = `${viewport.width}px`
-  container.style.height = `${viewport.height}px`
+  container.style.width = `${layout.width}px`
+  container.style.height = `${layout.height}px`
   container.style.pointerEvents = 'none'
   container.style.zIndex = '4'
 
@@ -459,19 +463,10 @@ export function buildHighlightLayer(
         highlight.classList.add('search-highlight--active')
       }
 
-      const [scaleX, skewX, skewY, scaleY, translateX, translateY] = fragment.transform
-
-      const scaledTransform = [
-        scaleX * viewport.scale,
-        skewX * viewport.scale,
-        skewY * viewport.scale,
-        scaleY * viewport.scale,
-        translateX * viewport.scale,
-        translateY * viewport.scale,
-      ]
-
-      const width = fragment.width * viewport.scale
-      const height = fragment.height * viewport.scale
+      // 与 PDF.js 文字层同一套 transform / 尺寸换算
+      const scaledTransform = layout.mapTransform(fragment.transform)
+      const width = layout.mapUnits(fragment.width)
+      const height = layout.mapUnits(fragment.height)
 
       highlight.style.cssText = `
         position: absolute;

@@ -188,9 +188,10 @@ import {
   loadPdfDocument, renderPageToCanvas, buildTextLayer,
   buildAnnotationLayer, preloadPdfjs, getPageBaseDimensions,
   searchDocument, buildHighlightLayer, clearHighlightLayer,
-  type PdfjsDocument, type PdfjsPage, type PdfjsViewport,
+  type PdfjsDocument, type PdfjsPage,
   type SearchResult, type SearchMatch, type PageSearchResult,
 } from '@/utils/pdf-engine'
+import { createPageGeometry } from '@/utils/page-geometry'
 
 const sampleFiles = [
   { name: 'sample.pdf', label: '示例一：学术论文' },
@@ -231,14 +232,16 @@ const allMatches = computed<SearchMatch[]>(() => {
 })
 
 /**
- * 每页的基础尺寸（scale=1 时的宽高），用于精确计算不同尺寸页面的布局。
- * 使用 reactive(Map) 确保 set/delete 操作触发视图更新。
+ * 缩放与坐标换算的单一数据源：页面基础尺寸（scale=1）只预计算一次，
+ * 页面像素尺寸、文字层 / 高亮矩形定位、搜索跳转偏移全部经它换算。
+ * 非响应式（不直接驱动 template），仅持有数值。
  */
-const pageBaseDims = reactive(new Map<number, { baseWidth: number; baseHeight: number }>())
+const pageGeometry = createPageGeometry(scale.value)
 
 /**
  * 每页在当前 scale 下的实际像素尺寸（响应式）。
- * getPageStyle() 依赖此 Map 驱动 template 中 .pdf-page 的宽高。
+ * getPageStyle() 依赖此 Map 驱动 template 中 .pdf-page 的宽高；
+ * 取值由 PageGeometry 统一换算后写入。
  */
 const pageDimensions = reactive(new Map<number, { width: number; height: number }>())
 
@@ -361,17 +364,9 @@ function refreshHighlights() {
     const container = highlightLayerRefs.get(pageNum)
     if (!container) continue
 
-    const base = pageBaseDims.get(pageNum)
-    if (!base) continue
-
-    const viewport = {
-      width: base.baseWidth * scale.value,
-      height: base.baseHeight * scale.value,
-      scale: scale.value,
-      rotation: 0,
-      transform: [1, 0, 0, 1, 0, 0],
-      clone: () => ({ /* 简化的 clone，实际高亮层不需要完整 viewport */ }),
-    } as unknown as PdfjsViewport
+    // 与页面 / 文字层同一份预计算布局口径，确保高亮矩形缩放后对齐
+    const layout = pageGeometry.getLayout(pageNum)
+    if (!layout) continue
 
     let pageCurrentIdx: number | undefined
     if (currentMatchIndex.value >= 0 && currentMatchIndex.value < allMatches.value.length) {
@@ -381,7 +376,7 @@ function refreshHighlights() {
       }
     }
 
-    buildHighlightLayer(container, matches, viewport, pageCurrentIdx)
+    buildHighlightLayer(container, matches, layout, pageCurrentIdx)
   }
 }
 
@@ -438,7 +433,7 @@ function jumpToMatch(match: SearchMatch) {
   const wrapperTop = wrapper.offsetTop
   const wrapperHeight = wrapper.offsetHeight
 
-  const matchTop = match.transform[5] * scale.value
+  const matchTop = pageGeometry.mapUnits(match.transform[5])
   const targetTop = wrapperTop + matchTop - containerHeight / 2
 
   containerRef.value.scrollTo({
@@ -481,11 +476,10 @@ function zoomIn() { if (scale.value < 5) scale.value = Math.min(5, +(scale.value
 function zoomOut() { if (scale.value > 0.25) scale.value = Math.max(0.25, +(scale.value - 0.25).toFixed(2)) }
 function fitWidth() {
   if (!containerRef.value || !pdfDoc.value) return
-  const containerWidth = containerRef.value.clientWidth - 64
-  // 使用第一页的基础宽度（scale=1）计算适合宽度的缩放比
-  const base = pageBaseDims.get(1)
-  if (!base) return
-  scale.value = +(containerWidth / base.baseWidth).toFixed(2)
+  // 适合宽度缩放比由 PageGeometry 按预计算的第一页基础宽度换算
+  const next = pageGeometry.fitWidthScale(containerRef.value.clientWidth)
+  if (next === undefined) return
+  scale.value = +next.toFixed(2)
 }
 
 /* ---- 页面尺寸 ---- */
@@ -494,14 +488,13 @@ function getPageStyle(n: number) {
   return d ? { width: `${d.width}px`, height: `${d.height}px` } : {}
 }
 
-/** 根据 pageBaseDims 和当前 scale 重新计算所有页面的像素尺寸 */
+/**
+ * 根据预计算的基础尺寸与当前 scale 重新计算所有页面的像素尺寸。
+ * 乘法只存在于 PageGeometry，这里只把换算结果写入响应式 Map。
+ */
 function recomputeScaledDimensions() {
-  const s = scale.value
-  for (const [n, base] of pageBaseDims) {
-    pageDimensions.set(n, {
-      width: base.baseWidth * s,
-      height: base.baseHeight * s,
-    })
+  for (const n of pageGeometry.pageNumbers()) {
+    pageDimensions.set(n, pageGeometry.getScaledSize(n)!)
   }
 }
 
@@ -512,11 +505,8 @@ function recomputeScaledDimensions() {
 async function precomputePageDimensions() {
   const doc = pdfDoc.value
   if (!doc) return
-  const baseDims = await getPageBaseDimensions(doc)
-  pageBaseDims.clear()
-  for (const [n, dim] of baseDims) {
-    pageBaseDims.set(n, dim)
-  }
+  pageGeometry.setScale(scale.value)
+  pageGeometry.setBaseSizes(await getPageBaseDimensions(doc))
   recomputeScaledDimensions()
 }
 
@@ -648,6 +638,8 @@ function onScroll() {
 /* ---- 缩放 watcher ---- */
 watch(scale, async () => {
   if (!pdfDoc.value) return
+  // 先同步换算口径，再统一重算尺寸 / 重渲染 / 重绘高亮
+  pageGeometry.setScale(scale.value)
   renderVersion++; renderQueue = []
   renderedPages.clear(); renderedPageOrder.length = 0
   recomputeScaledDimensions()
@@ -663,7 +655,7 @@ async function loadPdf(url: string) {
   loading.value = true; errorMsg.value = ''
   renderVersion++; renderQueue = []
   renderedPages.clear(); renderedPageOrder.length = 0
-  pageDimensions.clear(); pageBaseDims.clear()
+  pageDimensions.clear(); pageGeometry.clear()
   canvasRefs.clear(); textLayerRefs.clear()
   annotationLayerRefs.clear(); highlightLayerRefs.clear()
   pageWrapperRefs.clear()
