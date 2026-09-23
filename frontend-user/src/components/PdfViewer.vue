@@ -186,11 +186,15 @@
 import { ref, reactive, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import {
   loadPdfDocument, renderPageToCanvas, buildTextLayer,
-  buildAnnotationLayer, preloadPdfjs, getPageBaseDimensions,
+  buildAnnotationLayer, preloadPdfjs,
   searchDocument, buildHighlightLayer, clearHighlightLayer,
-  type PdfjsDocument, type PdfjsPage, type PdfjsViewport,
+  type PdfjsDocument, type PdfjsPage,
   type SearchResult, type SearchMatch, type PageSearchResult,
 } from '@/utils/pdf-engine'
+import {
+  scalePageDims, fitWidthScale, pdfYToPageOffset,
+} from '@/utils/page-geometry'
+import { usePageGeometry } from '@/composables/usePageGeometry'
 
 const sampleFiles = [
   { name: 'sample.pdf', label: '示例一：学术论文' },
@@ -231,16 +235,17 @@ const allMatches = computed<SearchMatch[]>(() => {
 })
 
 /**
- * 每页的基础尺寸（scale=1 时的宽高），用于精确计算不同尺寸页面的布局。
- * 使用 reactive(Map) 确保 set/delete 操作触发视图更新。
+ * 页面尺寸统一由 usePageGeometry 管理：
+ * pageBaseDims（scale=1 的预计算结果）是唯一数据来源，
+ * pageDimensions（驱动 .pdf-page 宽高）只通过统一换算生成。
  */
-const pageBaseDims = reactive(new Map<number, { baseWidth: number; baseHeight: number }>())
-
-/**
- * 每页在当前 scale 下的实际像素尺寸（响应式）。
- * getPageStyle() 依赖此 Map 驱动 template 中 .pdf-page 的宽高。
- */
-const pageDimensions = reactive(new Map<number, { width: number; height: number }>())
+const {
+  pageDimensions,
+  clearPageDims,
+  precompute: precomputePageDims,
+  recompute: recomputeScaledDimensions,
+  getBaseDims,
+} = usePageGeometry()
 
 /* ---- 非响应式内部状态（不驱动 template，无需 reactive） ---- */
 const canvasRefs = new Map<number, HTMLCanvasElement>()
@@ -361,17 +366,15 @@ function refreshHighlights() {
     const container = highlightLayerRefs.get(pageNum)
     if (!container) continue
 
-    const base = pageBaseDims.get(pageNum)
+    const base = getBaseDims(pageNum)
     if (!base) continue
 
-    const viewport = {
-      width: base.baseWidth * scale.value,
-      height: base.baseHeight * scale.value,
+    // 高亮层页面尺寸与矩形换算统一取自预计算基础尺寸（page-geometry），
+    // 与文字层、页面布局、搜索跳转共用同一口径，不再手造 viewport。
+    const drawInfo = {
+      ...scalePageDims(base, scale.value),
       scale: scale.value,
-      rotation: 0,
-      transform: [1, 0, 0, 1, 0, 0],
-      clone: () => ({ /* 简化的 clone，实际高亮层不需要完整 viewport */ }),
-    } as unknown as PdfjsViewport
+    }
 
     let pageCurrentIdx: number | undefined
     if (currentMatchIndex.value >= 0 && currentMatchIndex.value < allMatches.value.length) {
@@ -381,7 +384,7 @@ function refreshHighlights() {
       }
     }
 
-    buildHighlightLayer(container, matches, viewport, pageCurrentIdx)
+    buildHighlightLayer(container, matches, drawInfo, pageCurrentIdx)
   }
 }
 
@@ -438,7 +441,7 @@ function jumpToMatch(match: SearchMatch) {
   const wrapperTop = wrapper.offsetTop
   const wrapperHeight = wrapper.offsetHeight
 
-  const matchTop = match.transform[5] * scale.value
+  const matchTop = pdfYToPageOffset(match.transform[5], scale.value)
   const targetTop = wrapperTop + matchTop - containerHeight / 2
 
   containerRef.value.scrollTo({
@@ -482,42 +485,16 @@ function zoomOut() { if (scale.value > 0.25) scale.value = Math.max(0.25, +(scal
 function fitWidth() {
   if (!containerRef.value || !pdfDoc.value) return
   const containerWidth = containerRef.value.clientWidth - 64
-  // 使用第一页的基础宽度（scale=1）计算适合宽度的缩放比
-  const base = pageBaseDims.get(1)
+  // 适合宽度的缩放比统一由 page-geometry 依据预计算的第一页基础宽度求出
+  const base = getBaseDims(1)
   if (!base) return
-  scale.value = +(containerWidth / base.baseWidth).toFixed(2)
+  scale.value = fitWidthScale(containerWidth, base.baseWidth)
 }
 
 /* ---- 页面尺寸 ---- */
 function getPageStyle(n: number) {
   const d = pageDimensions.get(n)
   return d ? { width: `${d.width}px`, height: `${d.height}px` } : {}
-}
-
-/** 根据 pageBaseDims 和当前 scale 重新计算所有页面的像素尺寸 */
-function recomputeScaledDimensions() {
-  const s = scale.value
-  for (const [n, base] of pageBaseDims) {
-    pageDimensions.set(n, {
-      width: base.baseWidth * s,
-      height: base.baseHeight * s,
-    })
-  }
-}
-
-/**
- * 预计算所有页面的基础尺寸（scale=1）。
- * 逐页获取 viewport，正确处理混合页面大小（纵向/横向/不同尺寸）。
- */
-async function precomputePageDimensions() {
-  const doc = pdfDoc.value
-  if (!doc) return
-  const baseDims = await getPageBaseDimensions(doc)
-  pageBaseDims.clear()
-  for (const [n, dim] of baseDims) {
-    pageBaseDims.set(n, dim)
-  }
-  recomputeScaledDimensions()
 }
 
 /* ---- 页面回收（LRU） ---- */
@@ -566,9 +543,6 @@ async function renderPage(n: number, ver: number) {
 
   const { viewport } = await renderPageToCanvas(page, canvas, scale.value)
   if (ver !== renderVersion) return
-
-  // 渲染后用实际 viewport 修正尺寸（响应式更新 template）
-  pageDimensions.set(n, { width: viewport.width, height: viewport.height })
 
   await buildTextLayer(page, textDiv, viewport)
   if (ver !== renderVersion) return
@@ -650,7 +624,7 @@ watch(scale, async () => {
   if (!pdfDoc.value) return
   renderVersion++; renderQueue = []
   renderedPages.clear(); renderedPageOrder.length = 0
-  recomputeScaledDimensions()
+  recomputeScaledDimensions(scale.value)
   await nextTick()
   scheduleRender()
   if (searchResult.totalMatches > 0) {
@@ -663,7 +637,7 @@ async function loadPdf(url: string) {
   loading.value = true; errorMsg.value = ''
   renderVersion++; renderQueue = []
   renderedPages.clear(); renderedPageOrder.length = 0
-  pageDimensions.clear(); pageBaseDims.clear()
+  clearPageDims()
   canvasRefs.clear(); textLayerRefs.clear()
   annotationLayerRefs.clear(); highlightLayerRefs.clear()
   pageWrapperRefs.clear()
@@ -686,7 +660,7 @@ async function loadPdf(url: string) {
     pdfDoc.value = doc
     totalPages.value = doc.numPages
     currentVisiblePage.value = 1
-    await precomputePageDimensions()
+    await precomputePageDims(doc, scale.value)
     loading.value = false
     showToast(`加载成功，共 ${doc.numPages} 页`, 'success')
     await nextTick()

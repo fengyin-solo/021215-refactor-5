@@ -4,6 +4,11 @@
  * 2.x UMD 版本无 private class fields，彻底避免 Vite 兼容性问题
  */
 
+import {
+  fragmentToHighlightRect,
+  type HighlightDrawInfo,
+} from './page-geometry'
+
 /* ------------------------------------------------------------------ */
 /*  PDF.js 2.x 类型定义（无需 @types/pdfjs-dist，手动声明核心接口）       */
 /* ------------------------------------------------------------------ */
@@ -245,32 +250,6 @@ export async function buildAnnotationLayer(
   } catch { /* 注释层失败不影响核心功能 */ }
 }
 
-/**
- * 获取每页的原始尺寸（未缩放，scale=1）
- * 用于精确预计算不同尺寸页面的布局
- */
-export async function getPageBaseDimensions(
-  doc: PdfjsDocument,
-): Promise<Map<number, { baseWidth: number; baseHeight: number }>> {
-  const result = new Map<number, { baseWidth: number; baseHeight: number }>()
-  // 并发获取所有页面尺寸，每批 10 页避免过多并发
-  const batchSize = 10
-  for (let start = 1; start <= doc.numPages; start += batchSize) {
-    const end = Math.min(start + batchSize - 1, doc.numPages)
-    const promises: Promise<void>[] = []
-    for (let i = start; i <= end; i++) {
-      promises.push(
-        doc.getPage(i).then((page) => {
-          const vp = page.getViewport({ scale: 1 })
-          result.set(i, { baseWidth: vp.width, baseHeight: vp.height })
-        })
-      )
-    }
-    await Promise.all(promises)
-  }
-  return result
-}
-
 /* ------------------------------------------------------------------ */
 /*  全文搜索                                                            */
 /* ------------------------------------------------------------------ */
@@ -431,21 +410,24 @@ export async function searchDocument(
 }
 
 /**
- * 构建高亮层 — 根据搜索结果在页面上绘制高亮矩形
- * 高亮层使用与 PDF.js text layer 完全相同的坐标系统，确保缩放后精确对齐
+ * 构建高亮层 —— 根据搜索结果在页面上绘制高亮矩形
+ *
+ * 页面尺寸与矩形的缩放换算统一取自 page-geometry（与文字层、搜索跳转、
+ * 页面布局共用同一份口径），调用方不再需要手造 viewport。
  */
 export function buildHighlightLayer(
   container: HTMLDivElement,
   matches: SearchMatch[],
-  viewport: PdfjsViewport,
+  drawInfo: HighlightDrawInfo,
   currentMatchIndex?: number,
 ): void {
+  const { scale, width, height } = drawInfo
   container.innerHTML = ''
   container.style.position = 'absolute'
   container.style.top = '0'
   container.style.left = '0'
-  container.style.width = `${viewport.width}px`
-  container.style.height = `${viewport.height}px`
+  container.style.width = `${width}px`
+  container.style.height = `${height}px`
   container.style.pointerEvents = 'none'
   container.style.zIndex = '4'
 
@@ -459,27 +441,17 @@ export function buildHighlightLayer(
         highlight.classList.add('search-highlight--active')
       }
 
-      const [scaleX, skewX, skewY, scaleY, translateX, translateY] = fragment.transform
-
-      const scaledTransform = [
-        scaleX * viewport.scale,
-        skewX * viewport.scale,
-        skewY * viewport.scale,
-        scaleY * viewport.scale,
-        translateX * viewport.scale,
-        translateY * viewport.scale,
-      ]
-
-      const width = fragment.width * viewport.scale
-      const height = fragment.height * viewport.scale
+      // 唯一换算口径：fragment（PDF 单位）→ CSS 像素矩阵与宽高
+      const { matrix, width: rectWidth, height: rectHeight } =
+        fragmentToHighlightRect(fragment, scale)
 
       highlight.style.cssText = `
         position: absolute;
         left: 0;
         top: 0;
-        width: ${width}px;
-        height: ${height}px;
-        transform: matrix(${scaledTransform.join(',')});
+        width: ${rectWidth}px;
+        height: ${rectHeight}px;
+        transform: matrix(${matrix.join(',')});
         transform-origin: 0% 0%;
         background: rgba(255, 235, 59, 0.55);
         border-radius: 2px;
